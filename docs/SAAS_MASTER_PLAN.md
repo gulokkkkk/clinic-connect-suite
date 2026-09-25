@@ -1,152 +1,155 @@
-# Caddy Care — SaaS Master Plan (v2, replaces old IMPLEMENTATION_PLAN)
+# Caddy Care — SaaS Master Plan
 
-> Change from v1: **one shared backend for every clinic, but every clinic gets its own separate frontend (own UI, own design, own domain) — nothing visual is shared.** Hosting target: **Oracle Cloud Always Free**. AI: **Google Gemini, 3 API keys per clinic** (15+ keys total). First target: **3–5 clinics**, near-zero running cost.
+**Status:** approved product direction  
+**Initial market:** independent dental clinics in Pakistan  
+**Pilot target:** 3 clinics; architecture validated for 5 before scaling  
+**Deployment goal:** near-zero infrastructure cost during a controlled pilot
 
----
+## 1. Product promise
 
-## 1. The model in one picture
+Caddy Care gives a clinic its own branded digital front door and a complete operating system behind it: appointments, live queue, patient records, dental charting, treatment plans, prescriptions, billing, reminders, analytics, and controlled AI assistance.
 
-```text
-  clinic-a.com          drsmile.pk            cityhospital.caddy.care      admin.caddy.care
-  (Frontend A)          (Frontend B)          (Frontend C)                 (Super Admin app)
-  own design            own design            own design                   (you only)
-       \                    |                        /                          |
-        \   HTTPS + X-Clinic-Key + JWT              /                           |
-         v                  v                      v                            v
- +-------------------------------------------------------------------------------------+
- |  ONE backend  —  api.caddy.care  (Oracle ARM VM, Docker)                            |
- |  Caddy (TLS) -> Django 5 + DRF + Channels -> Celery workers                         |
- |  Tenant resolver: clinic key + Origin allow-list -> request.clinic                   |
- |  Gemini Key Pool: 3 keys per clinic, round-robin + failover + budget                |
- +-------------------------------------------------------------------------------------+
-     PostgreSQL 16 (self-hosted, same VM)   Redis   Object storage (Oracle / R2)
-```
+The product has one shared backend and database for operational efficiency. Each clinic can receive a separately designed and deployed public frontend. Patients see the clinic's identity; staff use reliable shared workflows; platform operators control the service without entering medical records by default.
 
-- **Backend = the product.** All logic, data, AI, queue, billing live here once.
-- **Frontend = the clinic's shop window.** Each clinic gets its own React app (separate repo/folder, separate deploy, separate domain). Different layout, fonts, colors, pages — you can design each one from scratch.
-- Frontends only talk to the API. They never share code that affects looks. They *may* share one small, invisible **`@caddy/sdk`** package (API client, types, auth helpers) so each new frontend takes days, not weeks.
+## 2. Decisions that define the system
 
-## 2. How any clinic registers (self-serve onboarding)
+1. **Shared core, separate brands.** Business logic and data contracts are centralized. Public presentation is not.
+2. **Tenant isolation from day one.** Every clinic-owned row, query, cache key, job, file path, realtime channel, export, and log context is scoped by clinic.
+3. **Server authority.** The browser never decides clinic access, staff permissions, prices, payment completion, or record ownership.
+4. **Dental-first workflow.** The first vertical includes odontograms, tooth surfaces, treatment plans, procedure stages, dental imaging references, and follow-ups.
+5. **AI is optional assistance.** It can answer clinic FAQs, help navigate booking, draft de-identified summaries, and assist documentation. It cannot diagnose, prescribe, or block core operations.
+6. **Operational control is a product.** Plans, limits, health, incidents, support sessions, exports, key status, suspensions, and audit history are controlled centrally.
+7. **Free tier has an exit plan.** Backups are portable and load thresholds trigger paid capacity before clinic operations become unreliable.
 
-1. Clinic owner opens `caddy.care/register` (your marketing site) → name, city, phone, specialty, plan.
-2. Backend creates: `Clinic` (status `trial`), owner user (`clinic_admin`), a **public clinic key** (`ck_live_...`), a 14-day trial.
-3. Owner lands in the **Clinic Admin panel** (a generic panel hosted by you, used by all clinics — this is a tool, not their brand) to add doctors, timings, fees, staff, FAQ, and **paste their 3 Gemini keys** (or you add them).
-4. You (or a template script) spin up their **own frontend**: `npx create-caddy-clinic drsmile` → copies a starter, sets `VITE_CLINIC_KEY`, `VITE_API_URL`. Designer customizes it. Deploy to Cloudflare Pages (free), connect their domain.
-5. Backend `Clinic.allowed_origins` gets their domain → CORS + tenant lock active. Go live.
-
-Result: registration is automatic; the custom look is the paid "setup" you sell.
-
-## 3. Multi-tenant rules (must never break)
-
-| Rule | How |
-|---|---|
-| Every tenant row has `clinic_id` | Base model `TenantModel`; DB index on `clinic_id` |
-| Clinic comes from the request, never the body | `TenantMiddleware`: `X-Clinic-Key` header → clinic; must match `Origin` in `allowed_origins` |
-| Staff can only act in their clinic | JWT contains `clinic_id` + `role`; checked against middleware clinic |
-| Queries auto-filtered | `TenantScopedViewSet.get_queryset()` filters by `request.clinic` |
-| Extra safety net | Postgres Row-Level Security with `SET app.clinic_id` per request (phase 2) |
-| Tests | Every endpoint has an "other clinic gets 404" test |
-| Patient across clinics | One `Patient` identity per phone, `PatientClinicLink` per clinic — Clinic A never sees Clinic B's visits |
-
-## 4. Roles and what each panel shows
-
-| Role | Panel | Sees / does |
-|---|---|---|
-| **Super Admin (you)** | `admin.caddy.care` | All clinics, plans, trials, invoices, key-pool health, AI usage per clinic, error logs, impersonate (audited), suspend clinic |
-| **Clinic Admin / Owner** | Clinic Admin panel | Everything in *their* clinic: doctors, staff, schedules, fees, patients, full patient profiles, all visits, revenue, cash closing, no-shows, reviews, AI chat logs, Gemini key status, audit log, branding/FAQ |
-| **Doctor** | Doctor console | Today's queue, call next, full patient profile + timeline, AI 3-line pre-visit summary, write Rx (voice or type), lab orders, follow-up, own earnings & stats |
-| **Receptionist** | Front desk | Walk-in check-in, token printing, queue control, bookings, cash collection, reminders; limited medical view (no notes) |
-| **Patient** | Clinic's own frontend | Book, live token/ETA, health vault, prescriptions PDF, lab reports, family members, chat with Caddy, reviews |
-
-### In-depth patient profile (what doctor/admin see)
-Demographics · MRN · family links · blood group · allergies (highlighted red) · chronic conditions · current medicines · vitals trend chart (BP, sugar, weight, temp) · visit timeline (complaint, diagnosis, notes, Rx) · lab reports with flagged values · attachments/images · follow-ups due · no-show count · payments/outstanding balance · AI summary · consent record · "who viewed this record" audit.
-
-## 5. Gemini key pool (3 per clinic)
+## 3. System shape
 
 ```text
-ClinicAIKey: clinic_id, label, key_encrypted (Fernet), status (active|cooldown|dead),
-             cooldown_until, requests_today, last_error, daily_budget
+Clinic A domain      Clinic B domain      Clinic C domain
+unique frontend      unique frontend      unique frontend
+        \                 |                 /
+         +---------- HTTPS API -----------+
+                         |
+              Tenant and auth boundary
+                         |
+         Shared application services and jobs
+            |            |             |
+        PostgreSQL      Redis       Object storage
+                         |
+               Platform control center
 ```
-- Selector picks the clinic's next `active` key (round-robin). On `429` → mark `cooldown` (honor Retry-After, else 60 s) and try the next key. On `401/403` → mark `dead`, alert owner + you on Telegram.
-- If all 3 are cooling down → friendly reply "Caddy is busy, please try in a minute" + booking still works via normal buttons. Never block core booking on AI.
-- Per-clinic daily cap so one clinic cannot burn shared spare keys. Keep 3 **spare pool keys** (yours) as emergency fallback, billed to your account only if you allow it.
-- Use cheaper **Flash / Flash-Lite** models for chat; cache FAQ answers in Redis; short system prompt.
-- **Important — privacy and terms:**
-  - On Gemini's **free tier Google may use prompts to improve its products.** Never send patient name, phone, CNIC or MRN — send de-identified text ("Patient, 45M, diabetic…"). For real medical summaries, move to a paid key later.
-  - Best practice: each clinic creates its **own** Google account + 3 keys (clinic-owned). Creating many free accounts yourself just to multiply limits can break Google's terms and get keys banned.
-- Keys stored encrypted; never sent to any frontend.
 
-## 6. Running it (almost) free
+The current repository is the first dental demo frontend and documentation home. Production implementation should use the current TanStack Start runtime for the web/server layer unless an architecture decision explicitly approves a separate backend service. See [Architecture](ARCHITECTURE.md).
 
-| Need | Free choice |
-|---|---|
-| Server | **Oracle Always Free ARM (Ampere A1)** — up to 4 cores / 24 GB RAM in total. One VM runs everything for 3–5 clinics |
-| Reverse proxy + HTTPS | Caddy server (auto Let's Encrypt) |
-| DB | PostgreSQL 16 in Docker on the same VM, plus Oracle block volume |
-| Cache / jobs | Redis in Docker + Celery |
-| Backups | Nightly `pg_dump` → Oracle Object Storage (free 20 GB) **and** Cloudflare R2 / Backblaze B2 (second copy) |
-| Files (labs, Rx PDFs) | Oracle Object Storage or Cloudflare R2 (10 GB free) |
-| Clinic frontends | Cloudflare Pages (free, unlimited sites) |
-| DNS / protection | Cloudflare free (hide VM IP, WAF, DDoS) |
-| Email | Brevo (≈300/day free) or Resend free tier |
-| Push notifications | Firebase Cloud Messaging (free) |
-| WhatsApp | Meta WhatsApp Cloud API — replies to patient-started chats are low/no cost; templated reminders cost per message (pass cost to the clinic) |
-| SMS | Avoid (paid in PK). Use WhatsApp + push first |
-| Monitoring | UptimeRobot, Sentry free, Grafana Cloud free, Telegram bot for alerts |
-| CI/CD | GitHub Actions → SSH deploy / Docker image on GHCR |
+## 4. Users and workspaces
 
-**Oracle warnings:** idle free VMs can be reclaimed — keep real traffic/cron running, or upgrade to Pay-As-You-Go (still free within limits, and protects the VM). ARM capacity in some regions is often "out of capacity" — retry or pick another region early. Always keep off-site backups.
-
-Estimated monthly cost for 3–5 clinics: **Rs 0 – 3,000** (domain + optional WhatsApp messages).
-
-## 7. Features real Pakistani clinics need (sell with these)
-
-**Daily pains → your answer**
-1. **Waiting-room crowd & token fights** → live token + "leave home now" WhatsApp alert + TV token board.
-2. **Phone rings all day** → WhatsApp/web Caddy bot books in Urdu / Roman Urdu / English.
-3. **No-shows** → reminder with Confirm/Cancel buttons, optional JazzCash/Easypaisa advance deposit.
-4. **Cash leakage by staff** → every fee entered at check-in, daily cash closing report, owner sees it on phone.
-5. **Load-shedding / internet down** → front desk works offline (PWA), syncs later; printable token slips.
-6. **Paper prescriptions lost** → digital Rx PDF + QR, Urdu dosage instructions ("subah, dopahar, raat").
-7. **Visiting doctors (doctor sits in 2–3 clinics)** → per-clinic schedules, doctor sees all their clinics.
-8. **Follow-ups forgotten** → auto follow-up reminders, 1-tap rebook.
-9. **Lab reports on WhatsApp chaos** → labs/staff upload into patient vault; flagged values.
-10. **Family bookings on one number** → family accounts.
-11. **Panel / corporate patients** → panel company field, monthly panel invoice.
-12. **Doctor share / commission** → per-doctor revenue split report.
-13. **Google reviews** → post-visit rating, happy patients redirected to Google.
-14. **Pharmacy & stock (optional add-on)** → basic in-house dispensary inventory.
-15. **Tax** → printable receipts with NTN/FBR-ready format (add-on).
-
-## 8. How you sell it
-
-- **Pitch (Urdu-friendly):** "Waiting room khali, phone band, har mareez ka record ek click pe. Aap ki clinic ki apni app — aap ke naam aur design ke saath."
-- **Why they pick you over generic software:** their own branded app/website (not a shared portal), WhatsApp bot, Urdu, works in load-shedding, cheap.
-- **Pricing (PKR):** Setup (custom frontend) Rs 25k–60k one time · Starter Rs 4,999/month per doctor · Clinic Rs 12,999/month (up to 5 doctors) · WhatsApp messages at cost. First 3 clinics: free setup in return for a case study + testimonial video.
-- **Sales path:** 1) find 10 clinics near you (dentists, skin, gynae, child specialists book the most) · 2) walk in with a demo on your phone showing *their* name · 3) offer 30-day free pilot · 4) measure wait time and no-shows before/after · 5) turn numbers into a 1-page case study · 6) ask for referrals (doctors know doctors).
-- **Legal basics:** Terms, Privacy Policy, Data Processing Agreement with each clinic, patient consent screen, "Not for emergencies — call 1122 / 115".
-
-## 9. Implementation phases (1–2 devs, free stack)
-
-| Phase | Weeks | Deliver |
+| Actor | Primary workspace | Core capabilities |
 |---|---|---|
-| 0 — Infra | 1 | Oracle VM, Docker compose (Caddy, Django, Postgres, Redis, Celery), Cloudflare, backups, CI |
-| 1 — Tenant core | 2–3 | Clinic registration, clinic keys, Origin lock, roles, JWT, phone OTP (WhatsApp OTP), audit log, super-admin app |
-| 2 — Clinic ops | 4–6 | Doctors, schedules, slot engine, booking, queue + WebSocket, walk-ins, TV board, cash entry |
-| 3 — Records | 6–8 | In-depth patient profile, visits, Rx PDF + QR, labs upload, vitals, family accounts |
-| 4 — AI | 8–9 | Key pool, Caddy chat (web), safety filter, booking tools with confirmation, de-identified pre-visit summary |
-| 5 — Frontend kit | 9–10 | `@caddy/sdk` + `create-caddy-clinic` starter; build clinic #1 custom frontend |
-| 6 — Sell-ready | 10–12 | WhatsApp bot, reminders, analytics dashboards, cash closing, Urdu, billing/trials, offline PWA front desk |
-| 7 — Pilot | 12+ | 3 pilot clinics, fix feedback, case studies, then clinics #4–5 |
+| Patient/guardian | Clinic-branded site and patient area | Book, reschedule, join queue, view own records/files, manage family, pay, consent |
+| Receptionist | Front desk | Register patient, book, check in, queue, collect payment, print; no private clinical notes |
+| Dental assistant | Clinical support | Prepare visit, record permitted observations, manage sterilization/tasks; restricted notes |
+| Dentist | Doctor workspace | Patient timeline, odontogram, diagnosis, treatment plan, procedure notes, prescription, follow-up |
+| Clinic manager | Operations | Schedules, staff, fees, services, inventory, cash close, reports; medical access only if granted |
+| Clinic owner/admin | Clinic administration | Memberships, settings, billing, exports, audit, reports, AI settings; no silent record editing |
+| Platform support | Control center | Service health and approved support sessions; no default clinical access |
+| Platform owner | Control center | Clinics, plans, limits, incidents, platform roles, suspensions, global health and audits |
 
-## 10. Key new tables (add to DATA_MODEL.md)
+One person may hold different roles in different clinics. Permissions are membership-based, never a global role copied onto the user profile.
 
-- `Clinic` + `public_key`, `allowed_origins text[]`, `plan`, `trial_ends_at`, `status (trial|active|suspended)`, `frontend_url`
-- `ClinicAIKey` (see §5), `AIUsage` (clinic, key, date, requests, tokens)
-- `CashEntry` (appointment, amount, method cash|jazzcash|easypaisa|card, received_by), `CashClosing` (date, expected, counted, diff)
-- `Vital` (patient, type, value, unit, taken_at)
-- `PanelCompany`, `DoctorShare` (doctor, percent)
-- `Review` (appointment, stars, text, sent_to_google)
+## 5. Clinic lifecycle
 
-## 11. Definition of Done
-Tenant isolation tests pass · works on 360 px phone · offline-safe front desk · no secrets in frontend · backup restore tested monthly · every AI reply carries emergency disclaimer.
+1. **Application:** owner supplies clinic identity, contact, city, specialty, expected doctors, and domain.
+2. **Verification:** platform operator verifies the clinic and owner before activating real patient data.
+3. **Provisioning:** create clinic, owner membership, plan limits, public configuration, file namespace, audit stream, and trial dates in one controlled workflow.
+4. **Setup:** clinic configures locations, chairs, services, prices, doctors, schedules, policies, reminders, brand, and consent text.
+5. **Frontend delivery:** build or customize that clinic's separate public experience against the stable API contract.
+6. **Readiness review:** permissions, backups, test booking, cancellation, payment, queue, record, export, and restore evidence must pass.
+7. **Trial and activation:** convert to paid manually during the pilot; record invoice and plan state.
+8. **Suspension:** block new writes except payment/export/support operations; preserve records and patient safety access according to policy.
+9. **Offboarding:** produce a clinic export, verify receipt, enforce retention/legal hold, revoke domains and keys, then schedule deletion.
+
+Self-service registration may be added after the pilot. It must not create an unverified clinic capable of storing real medical data without operational checks.
+
+## 6. Dental clinic workflows
+
+### Appointment to checkout
+
+1. Patient or receptionist selects location, service, dentist, date, and slot.
+2. Server validates schedule, duration, buffers, closures, chair availability, and duplicate holds.
+3. A short-lived slot hold prevents double booking; confirmation creates an appointment idempotently.
+4. Reminders allow confirm, cancel, or reschedule. Deposits are optional and clinic-configured.
+5. Check-in creates a queue entry. Staff can prioritize emergencies only with a recorded reason.
+6. Dentist reviews allergies and history, records examination and odontogram findings, creates a treatment plan, and documents work performed.
+7. Front desk generates an itemized invoice, records payment method and collector, and issues a receipt.
+8. Follow-up, post-operative instructions, and review request are scheduled.
+
+### Longitudinal patient profile
+
+Identity and contacts; guardians/family; consent; allergies; conditions; medicines; medical alerts; vitals; appointment and queue history; encounter timeline; odontogram versions; periodontal findings; treatment plans and approvals; procedures; prescriptions; imaging/file references; balances/refunds; reminders; and a record-access audit.
+
+Clinic A may not see Clinic B's clinical relationship with the same person. Identity matching can reduce duplicates internally, but clinic-visible records remain isolated.
+
+## 7. Platform control requirements
+
+The control center must provide clinic lifecycle state, plans and limits, feature flags, domains, deployment versions, uptime, job queues, backup status, storage growth, notification delivery, AI usage/key health, security events, incidents, and immutable operator actions.
+
+Support access is time-boxed, reason-bound, approved where required, visually obvious, read-only by default, and audited. Suspension, export, deletion, role changes, and impersonation require step-up authentication. Full detail is in [System control](SYSTEM_CONTROL.md).
+
+## 8. AI and Gemini policy
+
+Each clinic may supply up to three clinic-owned Gemini API keys. Keys are encrypted server-side and selected through a per-clinic pool with health, cooldown, quota, and revocation state. Creating many accounts merely to evade provider limits is not part of the product strategy.
+
+- Use low-cost models for public FAQ and booking guidance.
+- Redact direct identifiers before any free-tier request; reject content that cannot be made safe.
+- Never upload patient scans, photos, prescriptions, or raw files to free-tier AI.
+- Do not store model prompts/responses by default; retain only safe operational metadata unless the clinic enables a reviewed feature.
+- Require human confirmation before an AI draft enters a clinical record.
+- If all keys fail, switch off AI for that clinic and keep deterministic workflows available.
+- Alert on quota exhaustion, authentication failure, unusual usage, or repeated safety blocks.
+
+See [Security and privacy](SECURITY_AND_PRIVACY.md) and [System control](SYSTEM_CONTROL.md).
+
+## 9. Pakistan-focused value
+
+| Clinic pain | Product response |
+|---|---|
+| Crowded waiting room and token disputes | Live queue, transparent token state, estimated turn, TV board |
+| Calls interrupting staff | Web/WhatsApp booking with Urdu, Roman Urdu, and English content |
+| No-shows | Confirm/cancel reminders, waitlist, optional deposit |
+| Cash leakage | Itemized invoices, collector identity, immutable adjustments, daily cash close |
+| Load-shedding and unstable internet | Resilient front desk states, printable lists/tokens, safe retry and reconciliation |
+| Paper dental history | Odontogram and treatment timeline with file attachments |
+| Complex staged treatments | Treatment plan stages, estimates, approvals, installments, completed work |
+| Family members on one phone | Guardian and dependent relationships with consent boundaries |
+| Forgotten follow-ups | Recall rules for cleaning, braces, root canal stages, and post-operative checks |
+| Doctor revenue disputes | Procedure attribution and configurable share reports with adjustment audit |
+| Reports scattered in chat | Controlled patient vault and clinic upload workflow |
+
+WhatsApp templates and SMS are not free. Their actual provider cost must be passed through or limited by plan.
+
+## 10. Commercial model
+
+Sell an operational result, not a generic website: fewer calls, shorter perceived waits, visible cash, better follow-up, and one patient history.
+
+**Pilot offer:** use a clinic-branded demo, run a 30-day controlled pilot, measure baseline versus outcome, and secure a testimonial/case study. Do not promise legal compliance, unlimited uptime, or fully offline medical editing until verified.
+
+**Starting price hypothesis, to validate:** one-time design/onboarding fee of PKR 25,000–60,000; monthly clinic fee based on locations, doctors, storage, reminders, and support. Third-party messaging, domains, payment fees, and excess storage are pass-through costs. Final prices should follow interviews with at least 10 clinics and observed support load.
+
+## 11. Reliability and success targets
+
+- No confirmed double bookings under concurrent requests.
+- No cross-clinic record disclosure in automated and manual security tests.
+- Daily encrypted backup with a tested monthly restore; pilot target RPO 24 hours and RTO 8 hours.
+- Core clinic screens remain usable when Gemini, email, or WhatsApp is unavailable.
+- Every payment adjustment and clinical change identifies actor, time, clinic, reason, and before/after state where safe.
+- First clinic staff can complete registration-to-checkout without developer assistance.
+- Owners can reconcile daily collections against invoices and payment entries.
+
+## 12. Delivery and scope control
+
+Build the first dental demo before production persistence, then follow [Implementation roadmap](IMPLEMENTATION_ROADMAP.md). Pilot scope includes one location per clinic initially, core dental records, booking/queue, billing, reminders, reports, and operator controls.
+
+Defer pharmacy, insurance/panel automation, full accounting, native mobile apps, autonomous diagnosis, complex offline conflict resolution, and multi-region high availability until the pilot validates demand.
+
+## 13. Definition of production-ready pilot
+
+The pilot is ready only when tenant-isolation tests, permission tests, booking concurrency tests, audit coverage, backup restore, role-specific usability, incident contacts, legal documents, clinic export, AI fallback, and rollback procedures have passed. A polished demo alone is not a production backend.
